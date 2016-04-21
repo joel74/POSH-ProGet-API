@@ -2,12 +2,12 @@
 .SYNOPSIS  
     A module for working with the Proget API
 .DESCRIPTION  
-    This module queries the APIs for our hosted ProGet servers
+    This module uses the REST API on a ProGet server to work with feeds and Nuget packages
 .NOTES  
     File Name    : ProGet.psm1
     Author       : Joel Newton - jnewton@springcm.com
     Requires     : PowerShell V3
-    Dependencies : Nuget.exe, NuGet.ServerExtensions.dll
+    Dependencies : none
 
 #>
 
@@ -18,7 +18,6 @@ $ScriptLocation = split-path -parent $MyInvocation.MyCommand.Path
 $ProGetSettings = Get-Content -Path "$ScriptLocation\Settings.json" | Out-String | ConvertFrom-Json
 
 $API_KEY = $ProGetSettings.API_KEY
-$API_BaseURI = "$ProGetServerURL/api/json"
 
 $NuGet_API_Key = $ProGetSettings.NuGet_API_Key
 
@@ -34,6 +33,8 @@ Function Get-FeedList {
     )
 
     begin {
+
+        $API_BaseURI = "$ProGetServerURL/api/json"
 
     }
 
@@ -61,6 +62,8 @@ Function Get-FeedID{
     )
 
     begin {
+
+        $API_BaseURI = "$ProGetServerURL/api/json"
 
     }
 
@@ -92,7 +95,9 @@ Function Test-PackageIsInFeed {
     )
 
     begin {
-    
+
+        $API_BaseURI = "$ProGetServerURL/api/json"
+
     }
 
     process {
@@ -140,7 +145,9 @@ Function Test-PackageVersionIsInFeed {
 
     begin {
  
-    }
+        $API_BaseURI = "$ProGetServerURL/api/json"
+
+   }
 
     process {
 
@@ -204,8 +211,6 @@ Function Remove-PackageVersionFromFeed {
 }
 
 
-
-
 Function Get-LatestPackageVersion {
 
     [CmdletBinding()]
@@ -219,6 +224,8 @@ Function Get-LatestPackageVersion {
     )
 
     begin {
+
+        $API_BaseURI = "$ProGetServerURL/api/json"
 
     }
 
@@ -249,6 +256,8 @@ Function Get-Latest {
     )
 
     begin {
+
+        $API_BaseURI = "$ProGetServerURL/api/json"
 
     }
 
@@ -332,21 +341,37 @@ Function Copy-PackageToFeed {
 
     begin{
 
+        $API_BaseURI = "$ProGetServerURL/api/json"
         $SourceFeed = "$ProGetServerURL/nuget/$OriginFeedName"
         $ListTargetPackage = "$ProGetServerURL/nuget/$DestinationFeedName"
         $PushPackageURL = "$ProGetServerURL/api/v2/package/$DestinationFeedName"
+
+        $TempDir = $env:TEMP + '\ProGet_'+ ((get-date -Format o) -replace ':','-')
+        New-Item -Path $TempDir -ItemType Directory | Out-Null
+
+        #For encoding content
+        $CODEPAGE = "iso-8859-1" 
+        #Linefeed character
+        $LF = "`r`n"
 
     }
     process{
 
         ForEach ($PackageName in $PackageList){
 
-            #Make sure the package name and version exist before trying to promote
+            #Make sure the package name and version exist in the origin feed before trying to promote
             $PackageFound = Test-PackageVersionIsInFeed -ProGetServerURL $ProGetServerURL -FeedName $OriginFeedName -PackageName $PackageName -PackageVersion $PackageVersion 
-
             If ($PackageFound -eq $false){
 
                 $ThrowMessage = "Package $PackageName version $PackageVersion was not found in $SourceFeed."
+                Throw($ThrowMessage)
+            }
+
+            #Make sure this version of this package doesn't exist in the destination feed before trying to promote
+            $PackageFound = Test-PackageVersionIsInFeed -ProGetServerURL $ProGetServerURL -FeedName $DestinationFeedName -PackageName $PackageName -PackageVersion $PackageVersion 
+            If ($PackageFound -eq $true){
+
+                $ThrowMessage = "Package $PackageName version $PackageVersion already exists in $ListTargetPackage."
                 Throw($ThrowMessage)
             }
 
@@ -354,8 +379,45 @@ Function Copy-PackageToFeed {
             $Request = Invoke-WebRequest -Uri "$API_BaseURI/Feeds_GetFeed?API_Key=$API_KEY&Feed_Name=$OriginFeedName"
             $Feed = $Request.Content | ConvertFrom-Json
 
-            Write-Output "Mirroring version $PackageVersion of $PackageName from $SourceFeed to $ListTargetPackage"
-            cmd /c $ScriptLocation\bin\nuget.exe mirror $PackageName $ListTargetPackage $PushPackageURL -version $PackageVersion -source $SourceFeed -apikey $NuGet_API_Key -NoCache
+            #Download the package locally
+            $url = ($SourceFeed + '/package/' + $PackageName + '/' + $PackageVersion)
+            $LocalPackage = "$TempDir\$PackageName.$PackageVersion.nupkg"
+            (New-Object System.Net.WebClient).DownloadFile($url, $LocalPackage)
+
+            #Construct destination URL and headers
+            $DestinationURL = "http://progetna11/nuget/$DestinationFeedName/package/"
+            $headers = @{ "Content-Type"="multipart/form-data";"X-NuGet-ApiKey"="$NuGet_API_Key" }
+
+            #Read file byte-by-byte
+            $fileBin = [System.IO.File]::ReadAllBytes($LocalPackage)
+
+            #Convert byte-array to string
+            $enc = [System.Text.Encoding]::GetEncoding($CODEPAGE)
+            $fileEnc = $enc.GetString($fileBin)
+
+            #Create a boundary indicating the beginning and end of the package data
+            $boundary = [System.Guid]::NewGuid().ToString()
+
+            #Build the body
+            $bodyLines = @(
+            "------$boundary",
+            "Content-Disposition: form-data; name=`"package`"; filename=`"$PackageName.$PackageVersion.nupkg`"",
+            "Content-Type: application/octet-stream$LF",
+            $fileEnc,
+            "------$boundary--$LF"
+            ) -join $LF
+
+            try {
+                # Submit form-data with Invoke-RestMethod-Cmdlet
+                Invoke-RestMethod -Uri $DestinationURL -Method PUT -ContentType "multipart/form-data; boundary=----$boundary" -Body $bodyLines -Headers $headers
+            } catch {
+                $message = $_.ErrorDetails.Message | ConvertFrom-json | Select-Object -expandproperty message
+                $ErrorOutput = '"{0} {1}: {2}' -f $_.Exception.Response.StatusCode.value__,$_.Exception.Response.StatusDescription,($message,$ErrorMessage -ne $null)[0] 
+                Write-Error $ErrorOutput
+            }
+
+            #Remove the temp local folder
+            Remove-Item -Path $TempDir -Recurse | Out-Null
 
         }
 
