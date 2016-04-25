@@ -385,7 +385,7 @@ Function Copy-PackageToFeed {
             (New-Object System.Net.WebClient).DownloadFile($url, $LocalPackage)
 
             #Construct destination URL and headers
-            $DestinationURL = "http://progetna11/nuget/$DestinationFeedName/package/"
+            $DestinationURL = "$ProGetServerURL/nuget/$DestinationFeedName/package/"
             $headers = @{ "Content-Type"="multipart/form-data";"X-NuGet-ApiKey"="$NuGet_API_Key" }
 
             #Read file byte-by-byte
