@@ -371,8 +371,9 @@ Function Copy-PackageToFeed {
             $PackageFound = Test-PackageVersionIsInFeed -ProGetServerURL $ProGetServerURL -FeedName $DestinationFeedName -PackageName $PackageName -PackageVersion $PackageVersion 
             If ($PackageFound -eq $true){
 
-                $ThrowMessage = "Package $PackageName version $PackageVersion already exists in $ListTargetPackage."
-                Throw($ThrowMessage)
+                $WarningMessage = "Package $PackageName version $PackageVersion already exists in $ListTargetPackage."
+                Write-Warning $WarningMessage
+
             }
 
             #Retrieve the ID for the feed
