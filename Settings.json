@@ -1,5 +1,4 @@
 {
 	"API_KEY": "12345",
-	"API_BaseURI": "http://progetserver/api/json",
 	"NuGet_API_Key": "a1234567-b123-c123-d123-e123456789012"
 }
