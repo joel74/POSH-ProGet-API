@@ -252,27 +252,56 @@ Function Get-Latest {
    	    [Parameter(Mandatory=$true)]
         $ProGetServerURL,
         [Parameter(Mandatory=$true)]
-        $FeedName
+        $FeedName,
+        $Tag=''
     )
 
     begin {
 
         $API_BaseURI = "$ProGetServerURL/api/json"
+        $ODATA_BaseURI = "$ProGetServerURL/nuget"
 
     }
 
     process {
 
-        #Retrieve the ID for the feed
-        $Request = Invoke-WebRequest -Uri "$API_BaseURI/Feeds_GetFeed?API_Key=$API_KEY&Feed_Name=$FeedName" -UseBasicParsing
-        $Feed = $Request.Content | ConvertFrom-Json
-
         #Retrieve the package and version requested
-        $URI = "$API_BaseURI/NuGetPackages_GetLatest?API_Key=$API_KEY&Feed_Id=" + $Feed.Feed_Id 
-        $Request = Invoke-WebRequest -Uri $URI -UseBasicParsing
-        $PackageVersion = $Request.Content | ConvertFrom-Json
 
-        Write-Output($PackageVersion)
+        # JN: Old way - native API
+        # Retrieve the ID for the feed
+        # $Request = Invoke-WebRequest -Uri "$API_BaseURI/Feeds_GetFeed?API_Key=$API_KEY&Feed_Name=$FeedName" -UseBasicParsing
+        # $Feed = $Request.Content | ConvertFrom-Json
+        # $URI = "$API_BaseURI/NuGetPackages_GetLatest?API_Key=$API_KEY&Feed_Id=" + $Feed.Feed_Id
+
+        # New way - OData. Allows for filtering by tag value
+        $URI = "$ODATA_BaseURI/$FeedName/Search()?`$filter=IsLatestVersion%20eq%20true"
+        #If a tag was passed in, then add it to the query
+        If ($Tag -ne ''){
+            $URI += "%20and%20indexof(Tags,%27$Tag%27)%20gt%200"
+        }
+
+        $Request = Invoke-WebRequest -Uri $URI -UseBasicParsing
+
+        $PackageVersion = $Request.Content
+        $xml = New-Object xml
+        $xml.LoadXml($PackageVersion)
+
+
+        #JN: We have to loop through each object and create an array of custom objects because the package ID/name and the version, tags and descriptions are not with the same parent objects.
+        $array = @()
+
+        For ($i = 0;$i -lt $xml.feed.entry.count;$i++) {
+
+            $Package_ID = $xml.feed.entry.title[$i].'#text';
+            $Version = $xml.feed.entry.properties.version[$i]
+            $Tags = $xml.feed.entry.properties.tags[$i]
+            $Description = $xml.feed.entry.properties.description[$i]
+
+            $temp = New-Object PSObject ; $temp= @([pscustomobject]@{Package_ID=$Package_ID;Version=$Version;Version_Text=$Version;Tags=$Tags;Description=$Description} ); 
+            $array += $temp
+        }
+
+        Write-Output($array)
 
     }
 }
@@ -298,7 +327,6 @@ Function Get-Package{
     process {
 
         $Request = Invoke-WebRequest -Uri $URI -UseBasicParsing
-
         $PackageVersion = $Request.Content | ConvertFrom-Json
 
         Write-Output($PackageVersion.d.results)
@@ -329,12 +357,19 @@ Function Copy-PackageToFeed {
  
    	    [Parameter(Mandatory=$true)]
         $ProGetServerURL,
+
 	    [Parameter(Mandatory=$true)]
         [string[]]$PackageList,
-   	    [Parameter(Mandatory=$true)]
-        $PackageVersion,
+
+        [Parameter(Mandatory=$false,ParameterSetName='CopyLatest',ValueFromPipeline=$true)]
+        [switch]$Latest,
+
+        [Parameter(Mandatory=$false,ParameterSetName='CopySpecificVersion',ValueFromPipeline=$true)]
+        [string]$PackageVersion='',
+
    	    [Parameter(Mandatory=$true)]
         $OriginFeedName,
+
    	    [Parameter(Mandatory=$true)]
         $DestinationFeedName
     )
@@ -359,12 +394,26 @@ Function Copy-PackageToFeed {
 
         ForEach ($PackageName in $PackageList){
 
-            #Make sure the package name and version exist in the origin feed before trying to promote
-            $PackageFound = Test-PackageVersionIsInFeed -ProGetServerURL $ProGetServerURL -FeedName $OriginFeedName -PackageName $PackageName -PackageVersion $PackageVersion 
-            If ($PackageFound -eq $false){
+            #If copying the latest version of the package, then make sure the package exists in the origin feed
+            If ($Latest) {
+                $PackageVersion = Get-LatestPackageVersion -ProGetServerURL $ProGetServerURL -FeedName $OriginFeedName -PackageName $PackageName 
+                If (!($PackageVersion)){
 
-                $ThrowMessage = "Package $PackageName version $PackageVersion was not found in $SourceFeed."
-                Throw($ThrowMessage)
+                    $ThrowMessage = "Package $PackageName was not found in $SourceFeed."
+                    Throw($ThrowMessage)
+                }
+                Else {
+                    Write-Verbose ("Found version $PackageVersion of package $PackageName in feed $OriginFeedName.")
+                }
+            }
+            #Else if copying a specific version of a package, then make sure the package and version exist in the origin feed
+            Else {
+                $PackageFound = Test-PackageVersionIsInFeed -ProGetServerURL $ProGetServerURL -FeedName $OriginFeedName -PackageName $PackageName -PackageVersion $PackageVersion 
+                If ($PackageFound -eq $false){
+
+                    $ThrowMessage = "Package $PackageName version $PackageVersion was not found in $SourceFeed."
+                    Throw($ThrowMessage)
+                }
             }
 
             #Make sure this version of this package doesn't exist in the destination feed before trying to promote
@@ -373,7 +422,6 @@ Function Copy-PackageToFeed {
 
                 $WarningMessage = "Package $PackageName version $PackageVersion already exists in $ListTargetPackage."
                 Write-Warning $WarningMessage
-
             }
 
             #Retrieve the ID for the feed
@@ -424,4 +472,87 @@ Function Copy-PackageToFeed {
 
     }
 
+}
+
+
+Function Publish-Package {
+<#
+.SYNOPSIS
+   This script retrieves the latest versions of the packages on the specified origin feed and pushes them to the specified destination feed
+	
+.NOTES
+    PARAMETERS:
+    $ProGetServerURL
+    $PackageName
+    $PackageVersion
+    $OriginFeedName
+    $DestinationFeedName
+
+.EXAMPLE
+    Promote-Package -ProGetServerURL http://progetserver -PackageName Web -PackageVersion 1.1.0 -OriginFeedName Branch -DestinationFeedName Release -Comments 'Best package ever'
+
+#>
+    [CmdletBinding()]
+    param(
+ 
+   	    [Parameter(Mandatory=$true)]
+        $ProGetServerURL,
+
+	    [Parameter(Mandatory=$true)]
+        [string[]]$PackageList,
+
+        [Parameter(Mandatory=$false,ParameterSetName='CopyLatest',ValueFromPipeline=$true)]
+        [switch]$Latest,
+
+        [Parameter(Mandatory=$false,ParameterSetName='CopySpecificVersion',ValueFromPipeline=$true)]
+        [string]$PackageVersion='',
+
+   	    [Parameter(Mandatory=$true)]
+        $OriginFeedName,
+
+   	    [Parameter(Mandatory=$true)]
+        $DestinationFeedName,
+
+        $Comments
+    )
+
+    begin{
+        $API_Promotions = "$ProGetServerURL/api/promotions/promote"
+        $headers = @{ "X-ApiKey"="$API_KEY" } 
+
+        ForEach ($PackageName in $PackageList){
+
+            #If copying the latest version of the package, then make sure the package exists in the origin feed
+            If ($Latest) {
+                $PackageVersion = Get-LatestPackageVersion -ProGetServerURL $ProGetServerURL -FeedName $OriginFeedName -PackageName $PackageName 
+                If (!($PackageVersion)){
+
+                    $ThrowMessage = "Package $PackageName was not found in $SourceFeed."
+                    Throw($ThrowMessage)
+                }
+                Else {
+                    Write-Verbose ("Found version $PackageVersion of package $PackageName in feed $OriginFeedName.")
+                }
+            }
+            #Else if copying a specific version of a package, then make sure the package and version exist in the origin feed
+            Else {
+                $PackageFound = Test-PackageVersionIsInFeed -ProGetServerURL $ProGetServerURL -FeedName $OriginFeedName -PackageName $PackageName -PackageVersion $PackageVersion 
+                If ($PackageFound -eq $false){
+
+                    $ThrowMessage = "Package $PackageName version $PackageVersion was not found in $SourceFeed."
+                    Throw($ThrowMessage)
+                }
+            }
+
+            $Body = @{ 
+                packageName=$PackageName
+                version= $PackageVersion
+                fromFeed =$OriginFeedName
+                toFeed =$DestinationFeedName
+                comments= $Comments
+             } | ConvertTo-Json
+            Invoke-RestMethod -Uri $API_Promotions -Method POST -ContentType "application/json" -Body $Body -Headers $headers
+        }
+
+    }
 }
